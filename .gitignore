@@ -221,3 +221,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Agent-VCS runtime database
+*.db
+*.db-journal
