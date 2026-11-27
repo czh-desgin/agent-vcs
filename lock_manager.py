@@ -46,6 +46,53 @@ def normalize_path(res: str) -> str:
     return norm
 
 
+def _get_worktree_roots() -> list[Path]:
+    """获取当前仓库所有工作区根路径（按目录深度降序，优先匹配具体 worktree 隔间）"""
+    res = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError("当前目录不在 Git 仓库中，无法解析仓库路径。")
+
+    roots: list[Path] = []
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            roots.append(Path(line[len("worktree "):].strip()).resolve())
+    roots.sort(key=lambda p: len(p.parts), reverse=True)
+    return roots
+
+
+def resolve_resource_path(res: str, roots: list[Path]) -> str:
+    """将仓库内绝对路径或相对路径统一归一化为仓库相对路径，拒绝仓库外路径"""
+    cleaned = res.strip()
+    if not cleaned:
+        raise ValueError("资源路径不能为空。")
+
+    p = Path(cleaned)
+    if p.is_absolute():
+        resolved = p.resolve()
+        rel: Path | None = None
+        for root in roots:
+            try:
+                rel = resolved.relative_to(root)
+                break
+            except ValueError:
+                continue
+        if rel is None:
+            raise ValueError(f"绝对路径不在当前 Git 仓库内，无法加锁：{res}")
+        norm = normalize_path(rel.as_posix())
+    else:
+        norm = normalize_path(cleaned)
+
+    if norm in ("", ".") or norm == ".." or norm.startswith("../"):
+        raise ValueError(f"非法资源路径（不能指向仓库根目录或越出仓库外）：{res}")
+    return norm
+
+
 def _wal_disable_reason(db_path: str) -> str | None:
     """检查是否因环境变量、网络盘或云同步目录而禁用 WAL"""
     if os.environ.get("AGENT_VCS_WAL") == "0":
@@ -112,7 +159,14 @@ def declare_lock(agent_id: str, raw_resources: list[str], ttl: int = 60) -> bool
         print("[错误] 租约时间 ttl 必须大于 0。")
         return False
 
-    resources = list(dict.fromkeys(normalize_path(r) for r in raw_resources))
+    try:
+        roots = _get_worktree_roots()
+        resources = list(
+            dict.fromkeys(resolve_resource_path(r, roots) for r in raw_resources)
+        )
+    except ValueError as e:
+        print(f"[错误] {e}")
+        return False
 
     conn = get_conn()
     try:
