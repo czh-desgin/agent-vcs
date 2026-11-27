@@ -6,16 +6,6 @@ from pathlib import Path
 import lock_manager
 
 
-def get_main_repo_root() -> Path:
-    """通过公共 .git 目录锚定主仓库绝对根目录（即使在子目录或 worktree 内调用也准确）"""
-    common_dir = Path(lock_manager.get_db_path()).parent
-    return common_dir.parent
-
-
-def get_worktree_root() -> Path:
-    return get_main_repo_root() / ".worktrees"
-
-
 def run_git(
     args: list[str],
     cwd: Path | None = None,
@@ -30,6 +20,31 @@ def run_git(
         capture_output=True,
         check=check,
     )
+
+
+def get_main_repo_root() -> Path:
+    """通过 git worktree list --porcelain 取主工作区根目录（兼容子目录、worktree 与子模块，拒绝 bare 仓库）"""
+    res = run_git(["worktree", "list", "--porcelain"], check=False)
+    if res.returncode != 0:
+        raise RuntimeError("当前目录不在 Git 仓库中，无法定位主工作区。")
+
+    blocks = res.stdout.strip().split("\n\n")
+    if not blocks or not blocks[0].strip():
+        raise RuntimeError("无法解析 Git worktree 信息。")
+
+    first_lines = blocks[0].splitlines()
+    if any(line.strip() == "bare" for line in first_lines):
+        raise RuntimeError("不支持在 bare（裸）仓库中使用 workspace_manager。")
+
+    for line in first_lines:
+        if line.startswith("worktree "):
+            return Path(line[len("worktree "):].strip()).resolve()
+
+    raise RuntimeError("未能从 git worktree list 中解析出主仓库路径。")
+
+
+def get_worktree_root(repo_root: Path) -> Path:
+    return repo_root / ".worktrees"
 
 
 def get_default_branch(repo_root: Path) -> str:
@@ -63,13 +78,12 @@ def get_changed_files(wt_path: Path) -> set[str]:
     i = 0
     while i < len(entries):
         entry = entries[i]
-        if not entry:
+        if len(entry) < 4:
             i += 1
             continue
         status_code = entry[:2]
         path1 = entry[3:]
         changed.add(lock_manager.normalize_path(path1))
-        # 重命名(R)或复制(C)在 -z 格式下，紧随其后的下一个字段是旧路径
         if "R" in status_code or "C" in status_code:
             i += 1
             if i < len(entries) and entries[i]:
@@ -79,17 +93,29 @@ def get_changed_files(wt_path: Path) -> set[str]:
 
 
 def spawn(agent_id: str, resources: list[str], ttl: int = 300) -> bool:
-    """校验 ID -> 防止覆盖已有隔间 -> 原子抢锁 -> 开独立 worktree 隔间"""
+    """校验 ID -> 检查残留隔间与分支 -> 原子抢锁 -> 开独立 worktree 隔间"""
     if not lock_manager.validate_agent_id(agent_id):
         return False
 
     repo_root = get_main_repo_root()
-    wt_root = get_worktree_root()
+    wt_root = get_worktree_root(repo_root)
     wt_path = wt_root / agent_id
     branch_name = f"agent/{agent_id}"
 
     if wt_path.exists():
         print(f"[错误] {agent_id} 的工作区已存在：{wt_path}，请先 finish 或 abort。")
+        return False
+
+    branch_exists = run_git(
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        cwd=repo_root,
+        check=False,
+    )
+    if branch_exists.returncode == 0:
+        print(
+            f"[错误] 分支 {branch_name} 已存在（可能是上次合并冲突后保留的提交），"
+            "为防止丢失数据已拒绝覆盖。请手动检查或删除该分支后重试。"
+        )
         return False
 
     if not lock_manager.declare_lock(agent_id, resources, ttl=ttl):
@@ -114,12 +140,12 @@ def spawn(agent_id: str, resources: list[str], ttl: int = 300) -> bool:
 
 
 def finish(agent_id: str, message: str) -> bool:
-    """安检验收 -> 隔间内提交 -> 合并回主分支（冲突自动回滚） -> 拆隔间并解锁"""
+    """安检验收 -> 隔间内提交 -> 切回主分支 -> 合并（失败强制 abort） -> 拆隔间并解锁"""
     if not lock_manager.validate_agent_id(agent_id):
         return False
 
     repo_root = get_main_repo_root()
-    wt_path = get_worktree_root() / agent_id
+    wt_path = get_worktree_root(repo_root) / agent_id
     branch_name = f"agent/{agent_id}"
 
     if not wt_path.exists():
@@ -167,41 +193,47 @@ def finish(agent_id: str, message: str) -> bool:
         print(f"[错误] 隔间提交失败（现场已保留）：\n{e.stderr.strip()}")
         return False
 
-    # 5. 切回主仓库默认分支并合并（失败时强制 merge --abort 保全主干）
+    # 5. 切回主分支（单独捕获，与 merge 冲突区分开）
     base_branch = get_default_branch(repo_root)
     try:
         run_git(["checkout", base_branch], cwd=repo_root)
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[错误] 无法切换到主分支 {base_branch}（主仓库可能有未提交改动，隔间提交已保留）：\n"
+            f"{e.stderr.strip()}"
+        )
+        return False
+
+    # 6. 合并回主分支（失败时无条件执行 git merge --abort 保全主干）
+    try:
         run_git(["merge", "--no-edit", branch_name], cwd=repo_root)
         print(
             f"[交货成功] {agent_id} 的改动 {sorted(changed)} 已安全合并到 {base_branch}！"
         )
     except subprocess.CalledProcessError as e:
-        merge_head = Path(lock_manager.get_db_path()).parent / "MERGE_HEAD"
-        if merge_head.exists():
-            run_git(["merge", "--abort"], cwd=repo_root, check=False)
-            print(f"[回滚] 合并发生冲突，已自动执行 git merge --abort 保全 {base_branch} 分支。")
+        run_git(["merge", "--abort"], cwd=repo_root, check=False)
         print(
-            f"[错误] 合并分支 {branch_name} 失败（工作区与提交已保留，请排查冲突）：\n"
-            f"{e.stderr.strip()}"
+            f"[回滚] 合并分支 {branch_name} 失败，已执行 git merge --abort 保全 {base_branch} 分支"
+            f"（隔间与提交已保留，请排查冲突）：\n{e.stderr.strip()}"
         )
         return False
 
-    # 6. 合并成功后拆除隔间并解锁
+    # 7. 合并成功后拆除隔间并解锁
     abort(agent_id)
     return True
 
 
 def abort(agent_id: str) -> bool:
-    """拆除隔间、清理索引、删除临时分支，且通过 finally 保证必定释放锁"""
+    """拆除隔间、清理索引、删除临时分支，且通过最外层 finally 保证必定释放锁"""
     if not lock_manager.validate_agent_id(agent_id):
         return False
 
-    repo_root = get_main_repo_root()
-    wt_path = get_worktree_root() / agent_id
-    branch_name = f"agent/{agent_id}"
     ok = True
-
     try:
+        repo_root = get_main_repo_root()
+        wt_path = get_worktree_root(repo_root) / agent_id
+        branch_name = f"agent/{agent_id}"
+
         if wt_path.exists():
             res = run_git(
                 ["worktree", "remove", "--force", str(wt_path)],

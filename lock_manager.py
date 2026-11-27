@@ -44,11 +44,13 @@ def normalize_path(res: str) -> str:
     return norm
 
 
-def ensure_schema(conn: sqlite3.Connection):
-    """按需开启 WAL 并建表，避免每次连接都触发无谓的写事务"""
+def ensure_schema(conn: sqlite3.Connection, db_path: str):
+    """按需开启 WAL（网络盘 UNC 路径除外）并建表，避免每次连接都触发无谓的写事务"""
+    is_network_path = db_path.startswith("\\\\") or db_path.startswith("//")
+    target_mode = "delete" if is_network_path else "wal"
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    if mode.lower() != "wal":
-        conn.execute("PRAGMA journal_mode = WAL")
+    if mode.lower() != target_mode:
+        conn.execute(f"PRAGMA journal_mode = {target_mode.upper()}")
 
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='locks'"
@@ -76,7 +78,7 @@ def get_conn() -> sqlite3.Connection:
     db_path = get_db_path()
     conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
     conn.execute("PRAGMA busy_timeout = 5000")
-    ensure_schema(conn)
+    ensure_schema(conn, db_path)
     return conn
 
 
@@ -165,9 +167,7 @@ def renew(agent_id: str, ttl: int = 60) -> bool:
 
 
 def unlock(agent_id: str) -> bool:
-    if not validate_agent_id(agent_id):
-        return False
-
+    """释放指定 Agent 的锁（不做正则拦截，确保历史脏锁也能安全释放）"""
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
