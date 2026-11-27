@@ -225,3 +225,6 @@ __marimo__/
 # Agent-VCS runtime database
 *.db
 *.db-journal
+
+# Agent-VCS isolated workspaces
+.worktrees/
