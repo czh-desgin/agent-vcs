@@ -93,11 +93,14 @@ def get_changed_files(wt_path: Path) -> set[str]:
 
 
 def spawn(agent_id: str, resources: list[str], ttl: int = 300) -> bool:
-    """校验 ID -> 检查残留隔间与分支 -> 原子抢锁 -> 开独立 worktree 隔间"""
+    """校验 ID -> 清理残留 worktree 元数据 -> 检查隔间与分支 -> 原子抢锁 -> 开独立隔间"""
     if not lock_manager.validate_agent_id(agent_id):
         return False
 
     repo_root = get_main_repo_root()
+    # 先清理已被手动删除的孤儿 worktree 元数据，避免后续分支操作被死锁
+    run_git(["worktree", "prune"], cwd=repo_root, check=False)
+
     wt_root = get_worktree_root(repo_root)
     wt_path = wt_root / agent_id
     branch_name = f"agent/{agent_id}"
@@ -114,15 +117,19 @@ def spawn(agent_id: str, resources: list[str], ttl: int = 300) -> bool:
     if branch_exists.returncode == 0:
         print(
             f"[错误] 分支 {branch_name} 已存在（可能是上次合并冲突后保留的提交），"
-            "为防止丢失数据已拒绝覆盖。请手动检查或删除该分支后重试。"
+            "为防止丢失数据已拒绝覆盖。请按需执行以下命令手动处理：\n"
+            f"  git log --oneline {branch_name} -5   # 查看分支内容\n"
+            f"  git merge {branch_name}              # 保留并合并改动\n"
+            f"  git branch -D {branch_name}          # 确认丢弃该分支\n"
+            "  （若删除时报 used by worktree，请先执行 git worktree prune）"
         )
         return False
 
     if not lock_manager.declare_lock(agent_id, resources, ttl=ttl):
         return False
 
-    base_branch = get_default_branch(repo_root)
     try:
+        base_branch = get_default_branch(repo_root)
         wt_root.mkdir(exist_ok=True)
         run_git(
             ["worktree", "add", "-b", branch_name, str(wt_path), base_branch],
@@ -133,8 +140,9 @@ def spawn(agent_id: str, resources: list[str], ttl: int = 300) -> bool:
             f"(基于 {base_branch}，分支: {branch_name})"
         )
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"[错误] 创建工作区失败，正在自动回滚清理：\n{e.stderr.strip()}")
+    except (subprocess.CalledProcessError, RuntimeError, OSError) as e:
+        detail = e.stderr.strip() if isinstance(e, subprocess.CalledProcessError) else str(e)
+        print(f"[错误] 创建工作区失败，正在自动回滚清理：\n{detail}")
         abort(agent_id)
         return False
 

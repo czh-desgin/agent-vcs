@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 
 AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+SYNC_HINTS = ("onedrive", "dropbox", "坚果云", "nutstore", "googledrive", "icloud")
+_WAL_WARNED = False
 
 
 def validate_agent_id(agent_id: str) -> bool:
@@ -44,10 +46,28 @@ def normalize_path(res: str) -> str:
     return norm
 
 
+def _wal_disable_reason(db_path: str) -> str | None:
+    """检查是否因环境变量、网络盘或云同步目录而禁用 WAL"""
+    if os.environ.get("AGENT_VCS_WAL") == "0":
+        return "环境变量 AGENT_VCS_WAL=0"
+    if db_path.startswith("\\\\") or db_path.startswith("//"):
+        return "检测到网络共享路径 (UNC)"
+    lower_path = db_path.lower()
+    for hint in SYNC_HINTS:
+        if hint in lower_path:
+            return f"检测到云同步目录特征 ({hint})"
+    return None
+
+
 def ensure_schema(conn: sqlite3.Connection, db_path: str):
-    """按需开启 WAL（网络盘 UNC 路径除外）并建表，避免每次连接都触发无谓的写事务"""
-    is_network_path = db_path.startswith("\\\\") or db_path.startswith("//")
-    target_mode = "delete" if is_network_path else "wal"
+    """按需开启 WAL（规避网络盘与云同步目录）并建表，避免每次连接都触发无谓的写事务"""
+    global _WAL_WARNED
+    disable_reason = _wal_disable_reason(db_path)
+    target_mode = "delete" if disable_reason else "wal"
+    if disable_reason and not _WAL_WARNED:
+        print(f"[提示] 已关闭 SQLite WAL 模式（原因：{disable_reason}），改用 DELETE 日志模式。")
+        _WAL_WARNED = True
+
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     if mode.lower() != target_mode:
         conn.execute(f"PRAGMA journal_mode = {target_mode.upper()}")
@@ -133,7 +153,7 @@ def declare_lock(agent_id: str, raw_resources: list[str], ttl: int = 60) -> bool
 
 
 def renew(agent_id: str, ttl: int = 60) -> bool:
-    """为指定 Agent 当前仍有效的锁续期"""
+    """为指定 Agent 当前仍有效的锁续期，若期间有部分锁已过期则明确告警"""
     if not validate_agent_id(agent_id):
         return False
     if ttl <= 0:
@@ -145,6 +165,10 @@ def renew(agent_id: str, ttl: int = 60) -> bool:
         conn.execute("BEGIN IMMEDIATE")
         now = time.time()
 
+        total_before = conn.execute(
+            "SELECT COUNT(*) FROM locks WHERE agent_id = ?", (agent_id,)
+        ).fetchone()[0]
+
         conn.execute("DELETE FROM locks WHERE expires_at < ?", (now,))
         cur = conn.execute(
             "UPDATE locks SET expires_at = ? WHERE agent_id = ?",
@@ -152,11 +176,23 @@ def renew(agent_id: str, ttl: int = 60) -> bool:
         )
         conn.execute("COMMIT")
 
-        if cur.rowcount == 0:
-            print(f"[失败] {agent_id} 当前没有可续期的有效锁（可能已过期或未加锁）。")
+        renewed = cur.rowcount
+        expired_dropped = total_before - renewed
+
+        if renewed == 0:
+            if expired_dropped > 0:
+                print(f"[失败] {agent_id} 原有 {total_before} 把锁已全部过期并被清理，无法续期。")
+            else:
+                print(f"[失败] {agent_id} 当前没有可续期的有效锁（未加锁）。")
             return False
 
-        print(f"[续期] {agent_id} 的 {cur.rowcount} 把锁已续期 {ttl} 秒")
+        if expired_dropped > 0:
+            print(
+                f"[警告] {agent_id} 原有 {total_before} 把锁，其中 {expired_dropped} 把已过期被清理，"
+                f"仅 {renewed} 把成功续期 {ttl} 秒！"
+            )
+        else:
+            print(f"[续期] {agent_id} 的 {renewed} 把锁已续期 {ttl} 秒")
         return True
     except Exception:
         if conn.in_transaction:
